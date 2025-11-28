@@ -23,10 +23,20 @@ class Property:
     square_footage: int
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    last_sale_price: Optional[float] = None
+    last_sale_date: Optional[str] = None
+    estimated_annual_rent: Optional[float] = None
+    tax_assessment_value: Optional[float] = None
     
     @classmethod
     def from_api(cls, data: dict) -> 'Property':
         """Create a Property from API response data."""
+        # Get latest tax assessment if available
+        tax_value = None
+        if 'taxAssessments' in data and data['taxAssessments']:
+            latest_year = max(data['taxAssessments'].keys())
+            tax_value = data['taxAssessments'][latest_year].get('value')
+        
         return cls(
             id=data.get('id'),
             address=data.get('formattedAddress'),
@@ -38,7 +48,11 @@ class Property:
             bathrooms=data.get('bathrooms', 0),
             square_footage=data.get('squareFootage', 0),
             latitude=data.get('latitude'),
-            longitude=data.get('longitude')
+            longitude=data.get('longitude'),
+            last_sale_price=data.get('lastSalePrice'),
+            last_sale_date=data.get('lastSaleDate'),
+            estimated_annual_rent=None,  # Will be fetched separately if needed
+            tax_assessment_value=tax_value
         )
 
 
@@ -56,6 +70,7 @@ class InvestmentScorer:
     Scores properties based on real estate investment fundamentals.
     
     Scoring considers:
+    - Cap rate (annual rental income / property price)
     - Price per square foot (affordability)
     - Unit density (bedrooms/bathrooms relative to size)
     - Property size (larger properties = higher income potential)
@@ -64,31 +79,39 @@ class InvestmentScorer:
     
     def __init__(
         self,
-        price_per_sqft_weight: float = 0.35,
-        unit_density_weight: float = 0.30,
-        size_weight: float = 0.20,
-        property_type_weight: float = 0.15,
+        cap_rate_weight: float = 0.40,
+        price_per_sqft_weight: float = 0.25,
+        unit_density_weight: float = 0.20,
+        size_weight: float = 0.10,
+        property_type_weight: float = 0.05,
         # Thresholds for scoring (adjust based on market)
         target_price_per_sqft: float = 200,  # Optimal price per sqft
+        target_cap_rate: float = 0.08,  # Target 8% cap rate
         min_bedrooms: int = 2,
         min_bathrooms: int = 1,
         min_sqft: int = 800,
         ideal_sqft: int = 2000
     ):
+        self.cap_rate_weight = cap_rate_weight
         self.price_per_sqft_weight = price_per_sqft_weight
         self.unit_density_weight = unit_density_weight
         self.size_weight = size_weight
         self.property_type_weight = property_type_weight
         
         self.target_price_per_sqft = target_price_per_sqft
+        self.target_cap_rate = target_cap_rate
         self.min_bedrooms = min_bedrooms
         self.min_bathrooms = min_bathrooms
         self.min_sqft = min_sqft
         self.ideal_sqft = ideal_sqft
     
-    def score(self, property: Property) -> InvestmentScore:
+    def score(self, property: Property, estimated_monthly_rent: Optional[float] = None) -> InvestmentScore:
         """
         Calculate investment score for a property.
+        
+        Args:
+            property: Property object to score
+            estimated_monthly_rent: Optional monthly rent estimate (if not provided, estimated from market data)
         
         Returns a score from 0-100 where:
         - 0-30: Poor investment
@@ -99,17 +122,32 @@ class InvestmentScorer:
         """
         factors = {}
         
-        # 1. Price per square foot score (affordability)
-        # We estimate based on typical rental market expectations
-        # Lower price/sqft = better score
-        if property.square_footage > 0:
-            price_per_sqft = 200  # Use a baseline; would be property.price / sqft if price data available
+        # 1. Cap Rate Score (if we have price data)
+        # Cap Rate = Annual Rental Income / Property Price
+        if property.last_sale_price and property.last_sale_price > 0:
+            # Estimate annual rent (use provided rent or estimate based on unit density and market)
+            if estimated_monthly_rent:
+                annual_income = estimated_monthly_rent * 12
+            else:
+                # Estimate rent based on bedrooms as proxy
+                # Typical: $500-1500 per bedroom per month depending on location
+                annual_income = property.bedrooms * 800 * 12  # Conservative estimate
+            
+            cap_rate = annual_income / property.last_sale_price
+            cap_rate_score = self._score_cap_rate(cap_rate)
+            factors['cap_rate'] = cap_rate_score
+        else:
+            factors['cap_rate'] = 50  # Neutral score if no price data
+        
+        # 2. Price per square foot score (affordability)
+        if property.last_sale_price and property.square_footage > 0:
+            price_per_sqft = property.last_sale_price / property.square_footage
             price_score = self._score_price_per_sqft(price_per_sqft)
         else:
-            price_score = 0
+            price_score = 50  # Neutral if no data
         factors['price_per_sqft'] = price_score
         
-        # 2. Unit density score (bedrooms + bathrooms relative to size)
+        # 3. Unit density score (bedrooms + bathrooms relative to size)
         # More beds/baths in reasonable space = better rental income potential
         unit_density_score = self._score_unit_density(
             property.bedrooms,
@@ -118,18 +156,19 @@ class InvestmentScorer:
         )
         factors['unit_density'] = unit_density_score
         
-        # 3. Property size score
+        # 4. Property size score
         # Larger properties = higher absolute rental income potential
         size_score = self._score_size(property.square_footage)
         factors['property_size'] = size_score
         
-        # 4. Property type score
+        # 5. Property type score
         # Some types are better for rental income
         property_type_score = self._score_property_type(property.property_type)
         factors['property_type'] = property_type_score
         
         # Calculate weighted overall score
         overall_score = (
+            factors['cap_rate'] * self.cap_rate_weight +
             factors['price_per_sqft'] * self.price_per_sqft_weight +
             factors['unit_density'] * self.unit_density_weight +
             factors['property_size'] * self.size_weight +
@@ -145,6 +184,22 @@ class InvestmentScorer:
             factors={k: round(v, 1) for k, v in factors.items()},
             explanation=explanation
         )
+    
+    def _score_cap_rate(self, cap_rate: float) -> float:
+        """Score based on cap rate (0-100). Target is ~8% for good investments."""
+        # Convert to percentage
+        rate_pct = cap_rate * 100
+        
+        if rate_pct < 0:
+            return 0
+        elif rate_pct <= self.target_cap_rate * 100:
+            # Below target, score proportionally
+            return (rate_pct / (self.target_cap_rate * 100)) * 100
+        else:
+            # Above target (better return), score up to 100
+            # Diminishing returns for very high cap rates
+            excess = rate_pct - (self.target_cap_rate * 100)
+            return min(100, 100 + (excess * 2))
     
     def _score_price_per_sqft(self, price_per_sqft: float) -> float:
         """Score based on price per square foot (0-100)."""
@@ -211,7 +266,16 @@ class InvestmentScorer:
         explanation = f"{rating} Investment ({overall_score}/100)\n"
         explanation += f"  Address: {property.address}\n"
         explanation += f"  {property.bedrooms} bed, {property.bathrooms} bath | {property.square_footage} sqft | {property.property_type}\n"
+        
+        if property.last_sale_price:
+            price_per_sqft = property.last_sale_price / property.square_footage if property.square_footage > 0 else 0
+            explanation += f"  Last Sale: ${property.last_sale_price:,.0f} (${price_per_sqft:.2f}/sqft)\n"
+        
         explanation += f"\nScore Breakdown:\n"
+        
+        if 'cap_rate' in factors:
+            explanation += f"  • Cap Rate: {factors['cap_rate']}/100\n"
+        
         explanation += f"  • Affordability (Price/sqft): {factors['price_per_sqft']}/100\n"
         explanation += f"  • Unit Density: {factors['unit_density']}/100\n"
         explanation += f"  • Property Size: {factors['property_size']}/100\n"
