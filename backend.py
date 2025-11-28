@@ -321,9 +321,51 @@ def fetch_properties(zip_code: str, limit: int = 20, bedrooms: int = None, bathr
     return [Property.from_api(data) for data in response.json()]
 
 
-def score_properties_in_zipcode(zip_code: str, limit: int = 20) -> List[InvestmentScore]:
-    """Fetch and score all properties in a zip code."""
+def fetch_rent_estimate(address: str, city: str, state: str) -> Optional[float]:
+    """
+    Fetch estimated monthly rent for a property from RentCast API.
+    
+    Returns estimated monthly rent or None if not available.
+    """
+    try:
+        response = httpx.get(
+            'https://api.rentcast.io/v1/avm/rent',
+            headers={'X-Api-Key': api_key, 'Accept': 'application/json'},
+            params={
+                'address': address,
+                'city': city,
+                'state': state
+            }
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('monthlyRentEstimate')
+    except Exception as e:
+        print(f"Error fetching rent estimate: {e}")
+    
+    return None
+
+
+def score_properties_in_zipcode(zip_code: str, limit: int = 20, include_rent_estimates: bool = False) -> List[InvestmentScore]:
+    """Fetch and score all properties in a zip code.
+    
+    Args:
+        zip_code: Target zip code
+        limit: Max properties to fetch
+        include_rent_estimates: If True, fetch actual rent estimates from API (slower but more accurate)
+    """
     scorer = InvestmentScorer()
     properties = fetch_properties(zip_code, limit=limit)
-    scores = [scorer.score(prop) for prop in properties]
+    
+    scores = []
+    for prop in properties:
+        # Optionally fetch actual rent estimate
+        estimated_rent = None
+        if include_rent_estimates:
+            estimated_rent = fetch_rent_estimate(prop.address.split(',')[0], prop.city, prop.state)
+        
+        score = scorer.score(prop, estimated_monthly_rent=estimated_rent)
+        scores.append(score)
+    
     return sorted(scores, key=lambda s: s.overall_score, reverse=True)
